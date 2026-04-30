@@ -1,0 +1,19 @@
+services:
+  backend-node:
+    build: .
+    env_file: .env
+    ports:
+      - "4200:4200"
+    volumes:
+      - backend-node-data:/data
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    command: ["--logtostderr"]
+    ports:
+      - "6380:6379"
+    volumes:
+      - backend-node-dragonfly:/data
+
+volumes:
+  backend-node-data:
+  backend-node-dragonfly:
