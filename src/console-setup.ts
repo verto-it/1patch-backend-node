@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
@@ -12,7 +11,6 @@ type BackendNodeConfig = {
   dragonflyUrl: string;
   tenantId: string;
   packageCachePath: string;
-  signingSecret: string;
   nodeApiSecret: string;
   corsAllowedOrigins: string;
 };
@@ -152,7 +150,6 @@ async function promptForConfig(): Promise<BackendNodeConfig> {
       dragonflyUrl: await question(rl, 'DragonflyDB URL', process.env.DRAGONFLY_URL || 'redis://localhost:6380'),
       tenantId: process.env.TENANT_ID || 'default',
       packageCachePath: process.env.PACKAGE_CACHE_PATH || './package-cache',
-      signingSecret: process.env.SIGNING_SECRET || randomBytes(32).toString('hex'),
       nodeApiSecret,
       corsAllowedOrigins: await question(rl, 'CORS_ALLOWED_ORIGINS (comma-separated, leave blank to disable)', process.env.CORS_ALLOWED_ORIGINS ?? ''),
     };
@@ -181,7 +178,6 @@ function configFromEnrollment(enrollment: CompleteEnrollmentJson): BackendNodeCo
     dragonflyUrl: enrollment.dragonflyUrl,
     tenantId: process.env.TENANT_ID || 'default',
     packageCachePath: process.env.PACKAGE_CACHE_PATH || './package-cache',
-    signingSecret: process.env.SIGNING_SECRET || randomBytes(32).toString('hex'),
     nodeApiSecret: enrollment.nodeApiSecret ?? process.env.NODE_API_SECRET ?? '',
     corsAllowedOrigins: process.env.CORS_ALLOWED_ORIGINS ?? '',
   };
@@ -299,7 +295,6 @@ function writeConfig(config: BackendNodeConfig) {
       `TENANT_ID=${config.tenantId}`,
       `DRAGONFLY_URL=${config.dragonflyUrl}`,
       `PACKAGE_CACHE_PATH=${config.packageCachePath}`,
-      `SIGNING_SECRET=${config.signingSecret}`,
       `NODE_API_SECRET=${config.nodeApiSecret}`,
       `CORS_ALLOWED_ORIGINS=${config.corsAllowedOrigins}`,
       '',
@@ -318,7 +313,6 @@ function applyConfig(config: BackendNodeConfig) {
   process.env.TENANT_ID = config.tenantId;
   process.env.DRAGONFLY_URL = config.dragonflyUrl;
   process.env.PACKAGE_CACHE_PATH = config.packageCachePath;
-  process.env.SIGNING_SECRET = config.signingSecret;
   process.env.NODE_API_SECRET = config.nodeApiSecret;
   process.env.CORS_ALLOWED_ORIGINS = config.corsAllowedOrigins;
 }

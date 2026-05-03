@@ -26,7 +26,7 @@ Run this from any machine that can reach the management server:
 ```powershell
 $enrollment = Invoke-RestMethod `
   -Method Post "https://manage.1patch.local:4100/nodes/enrollments" `
-  -Headers @{ "x-1patch-admin-token" = "<ADMIN_API_TOKEN>" } `
+  -Headers @{ "Authorization" = "Bearer <admin-jwt>" } `
   -ContentType "application/json" `
   -Body '{ "name": "node-1", "publicUrl": "https://node-1.1patch.local:4200" }'
 
@@ -81,7 +81,6 @@ All variables are written to `.env` by `setup-backend-node.ps1`. Reference:
 | `MANAGEMENT_URL` | yes | Management server base URL |
 | `NODE_API_SECRET` | yes | Min 32 chars — must match `NODE_API_SECRET` on the management server |
 | `DRAGONFLY_URL` | yes | Redis-compatible connection string |
-| `SIGNING_SECRET` | yes | Min 32 chars — HMAC-signs node-local payloads |
 | `CORS_ALLOWED_ORIGINS` | no | Comma-separated origins for browser-facing routes |
 | `NODE_TLS_DIR` | no | Directory for mTLS cert files (default `./tls`) |
 | `REQUEST_BODY_LIMIT` | no | Max request body size (default `10mb`) |
@@ -114,6 +113,8 @@ All variables are written to `.env` by `setup-backend-node.ps1`. Reference:
 ## How the Queue Works
 
 Every event from a client (heartbeat, inventory, task result, alarm) is written to DragonflyDB immediately and acknowledged to the client. A background job flushes the queue to the management server every 60 seconds. If the management server is unreachable, events stay in the queue and are retried on the next flush cycle — no client data is lost.
+
+Task bundles pulled from management are ES256-signed by management and relayed to clients unchanged. Backend nodes do not have management private signing keys and cannot forge client-executable tasks.
 
 See [`docs/offline-queue.md`](docs/offline-queue.md) for full details.
 

@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { v4 as uuid } from 'uuid';
 import { DragonflyService } from '../storage/dragonfly.service';
-import { AgentTask } from '../types';
+import { AgentTask, SignedEnvelope, TaskBundle } from '../types';
 
 @Injectable()
 export class TaskStore {
@@ -15,25 +15,24 @@ export class TaskStore {
     return task;
   }
 
-  async addMany(tasks: AgentTask[]) {
-    const fresh = tasks;
-    for (const task of fresh) {
-      await this.dragonfly.lpushJson(this.key, task);
+  async addMany(envelopes: SignedEnvelope<TaskBundle>[]) {
+    for (const envelope of envelopes) {
+      await this.dragonfly.lpushJson(this.key, envelope);
     }
-    return fresh.length;
+    return envelopes.reduce((total, envelope) => total + (envelope.payload.tasks?.length ?? 0), 0);
   }
 
   async nextForDevice(deviceId: string) {
-    const deferred: AgentTask[] = [];
-    const selected: AgentTask[] = [];
+    const deferred: SignedEnvelope<TaskBundle>[] = [];
+    const selected: SignedEnvelope<TaskBundle>[] = [];
     const count = await this.size();
     for (let index = 0; index < count; index += 1) {
-      const task = await this.dragonfly.rpopJson<AgentTask>(this.key);
-      if (!task) break;
-      if (task.deviceId === deviceId) selected.push(task);
-      else deferred.push(task);
+      const envelope = await this.dragonfly.rpopJson<SignedEnvelope<TaskBundle>>(this.key);
+      if (!envelope) break;
+      if (envelope.payload.tasks.some((task) => task.deviceId === deviceId)) selected.push(envelope);
+      else deferred.push(envelope);
     }
-    for (const task of deferred.reverse()) await this.dragonfly.lpushJson(this.key, task);
+    for (const envelope of deferred.reverse()) await this.dragonfly.lpushJson(this.key, envelope);
     return selected;
   }
 

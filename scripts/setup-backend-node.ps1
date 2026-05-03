@@ -27,7 +27,6 @@ TENANT_ID=default
 DRAGONFLY_URL=$DragonflyUrl
 NODE_API_SECRET=$NodeApiSecret
 CORS_ALLOWED_ORIGINS=$CorsAllowedOrigins
-SIGNING_SECRET=$([Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)))
 "@ | Set-Content -Path ".env" -Encoding utf8
 
 Write-Host ""

@@ -7,7 +7,7 @@ import { Agent, fetch as undiciFetch } from 'undici';
 import { EventQueueService } from '../queue/event-queue.service';
 import { PackageCacheService } from '../packages/package-cache.service';
 import { TaskStore } from '../tasks/task.store';
-import { AgentTask } from '../types';
+import { SignedEnvelope, TaskBundle } from '../types';
 
 /**
  * Directory where the Vault-issued mTLS cert and key are persisted on this node.
@@ -191,16 +191,16 @@ export class ManagementService implements OnApplicationBootstrap {
         headers: { 'x-node-api-secret': process.env.NODE_API_SECRET ?? '' },
       });
       if (!res.ok) { const body = await res.text(); throw new Error(`task pull failed: HTTP ${res.status} — ${body}`); }
-      const body = (await res.json()) as { tasks: AgentTask[] };
+      const body = (await res.json()) as { tasks?: SignedEnvelope<TaskBundle>[] };
       const incoming = body.tasks ?? [];
-      if (incoming.length === 0) { this.logger.debug('No pending tasks from management server'); return { pulled: 0 }; }
-      this.logger.log(`Pulled ${incoming.length} task(s) from management server — caching packages`);
-      const cachedTasks: AgentTask[] = [];
-      for (const task of incoming) {
-        try { cachedTasks.push(await this.packages.ensureCached(task)); }
+      const tasks = incoming.flatMap((envelope) => envelope.payload.tasks ?? []);
+      if (incoming.length === 0 || tasks.length === 0) { this.logger.debug('No pending tasks from management server'); return { pulled: 0 }; }
+      this.logger.log(`Pulled ${tasks.length} signed task(s) from management server — caching packages without mutating signed payloads`);
+      for (const task of tasks) {
+        try { await this.packages.ensureCached(task); }
         catch (err) { this.logger.error(`Failed to cache package for taskId=${task.id}: ${err instanceof Error ? err.message : String(err)}`); }
       }
-      const pulled = await this.tasks.addMany(cachedTasks);
+      const pulled = await this.tasks.addMany(incoming);
       this.logger.log(`${pulled} task(s) queued for device delivery`);
       return { pulled };
     } catch (error) {

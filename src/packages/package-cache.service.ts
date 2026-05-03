@@ -30,10 +30,7 @@ export class PackageCacheService {
       await writeFile(path, data);
       this.logger.log(`Cached package ${task.packageArtifactId}`);
     }
-    return {
-      ...task,
-      sourceUrl: `${process.env.NODE_PUBLIC_URL?.replace(/\/$/, '') ?? ''}/packages/cache/${task.packageArtifactId}`,
-    };
+    return task;
   }
 
   stream(packageArtifactId: string) {
