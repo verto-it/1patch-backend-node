@@ -2,6 +2,10 @@ services:
   backend-node:
     build: .
     env_file: .env
+    environment:
+      DRAGONFLY_URL: redis://dragonfly:6379
+    depends_on:
+      - dragonfly
     ports:
       - "4200:4200"
     volumes:

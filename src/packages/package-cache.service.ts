@@ -16,7 +16,11 @@ export class PackageCacheService {
     const path = this.pathFor(task.packageArtifactId);
     if (!existsSync(path)) {
       const url = this.resolveManagementUrl(task.sourceUrl);
-      const res = await fetch(url);
+      const res = await fetch(url, {
+        headers: {
+          'x-node-api-secret': process.env.NODE_API_SECRET ?? '',
+        },
+      });
       if (!res.ok) throw new Error(`Package download failed: ${res.status}`);
       const data = Buffer.from(await res.arrayBuffer());
       const actual = createHash('sha256').update(data).digest('hex');

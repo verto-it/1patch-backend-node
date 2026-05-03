@@ -1,8 +1,10 @@
 import { Body, Controller, Get, Param, Post } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { IsArray, IsString } from 'class-validator';
+import { ManagementService } from '../management/management.service';
 import { EventQueueService } from '../queue/event-queue.service';
 import { TaskStore } from '../tasks/task.store';
+import { QueueEvent } from '../types';
 
 class RegisterDeviceDto {
   @IsString()
@@ -19,6 +21,9 @@ class RegisterDeviceDto {
 
   @IsString()
   publicKey!: string;
+
+  @IsString()
+  enrollmentToken!: string;
 }
 
 class InventoryDto {
@@ -32,7 +37,11 @@ class InventoryDto {
 @ApiTags('agent')
 @Controller('/agent')
 export class AgentController {
-  constructor(private readonly queue: EventQueueService, private readonly tasks: TaskStore) {}
+  constructor(
+    private readonly queue: EventQueueService,
+    private readonly tasks: TaskStore,
+    private readonly management: ManagementService,
+  ) {}
 
   @Post('/register')
   register(@Body() dto: RegisterDeviceDto) {
@@ -46,7 +55,7 @@ export class AgentController {
 
   @Post('/inventory')
   inventory(@Body() dto: InventoryDto) {
-    return this.queue.enqueue('inventory', dto);
+    return this.enqueueAndFlush('inventory', dto);
   }
 
   @Get('/tasks/:deviceId')
@@ -56,11 +65,17 @@ export class AgentController {
 
   @Post('/tasks/result')
   taskResult(@Body() dto: { deviceId: string; taskId: string; status: string; output?: string }) {
-    return this.queue.enqueue('task_result', dto);
+    return this.enqueueAndFlush('task_result', dto);
   }
 
   @Post('/alarms')
   alarm(@Body() dto: { deviceId: string; severity: string; message: string; metadata?: Record<string, unknown> }) {
-    return this.queue.enqueue('alarm', dto);
+    return this.enqueueAndFlush('alarm', dto);
+  }
+
+  private async enqueueAndFlush(type: QueueEvent['type'], payload: unknown) {
+    const event = await this.queue.enqueue(type, payload);
+    this.management.requestFlush();
+    return event;
   }
 }
