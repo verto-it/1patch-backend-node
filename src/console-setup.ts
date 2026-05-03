@@ -11,7 +11,6 @@ type BackendNodeConfig = {
   dragonflyUrl: string;
   tenantId: string;
   packageCachePath: string;
-  nodeApiSecret: string;
   corsAllowedOrigins: string;
 };
 
@@ -21,14 +20,13 @@ type EnrollmentJson = {
   nodeId?: string;
   nodeEnrollmentToken?: string;
   dragonflyUrl?: string;
-  // Injected by the management server so operators only copy-paste one blob
-  nodeApiSecret?: string;
 };
 
-type CompleteEnrollmentJson = Required<Omit<EnrollmentJson, 'nodeApiSecret'>> & Pick<EnrollmentJson, 'nodeApiSecret'>;
+type CompleteEnrollmentJson = Required<Omit<EnrollmentJson, 'dragonflyUrl'>> & Pick<EnrollmentJson, 'dragonflyUrl'>;
 
 const envPath = '.env';
 const defaultBackendNodePort = process.env.DEFAULT_BACKEND_NODE_PORT || '4200';
+
 
 export async function ensureConsoleSetup() {
   console.log('Checking backend node configuration...');
@@ -36,20 +34,16 @@ export async function ensureConsoleSetup() {
   if (hasRequiredConfig()) {
     console.log(`Backend node configuration found for node ${process.env.NODE_ID}.`);
     console.log(`Management URL: ${process.env.MANAGEMENT_URL}`);
-    if (!process.env.NODE_API_SECRET || process.env.NODE_API_SECRET.length < 32) {
-      console.warn('[WARN] NODE_API_SECRET is not set or too short — requests to the management server will be rejected.');
-    }
     return;
   }
-    
+
   console.log('Backend node configuration is missing.');
 
   if (!process.stdin.isTTY) {
     console.error(
       [
         '1Patch Backend Node is not configured.',
-        'Set NODE_ID, NODE_ENROLLMENT_TOKEN, NODE_PUBLIC_URL, MANAGEMENT_URL, DRAGONFLY_URL,',
-        'and NODE_API_SECRET in .env.',
+        'Set NODE_ID, NODE_ENROLLMENT_TOKEN, NODE_PUBLIC_URL, MANAGEMENT_URL, and DRAGONFLY_URL in .env.',
         'Create an enrollment from the management dashboard, then restart this process.',
       ].join('\n'),
     );
@@ -109,20 +103,11 @@ async function promptForConfig(): Promise<BackendNodeConfig> {
         );
       }
 
-      // dragonflyUrl may be blank if the management server did not know it
       if (!enrollment.dragonflyUrl) {
         enrollment.dragonflyUrl = await question(rl, 'DragonflyDB URL', process.env.DRAGONFLY_URL || 'redis://localhost:6380');
       }
 
       const config = configFromEnrollment(enrollment);
-
-      // If the enrollment JSON did not carry a nodeApiSecret, prompt for it
-      if (!config.nodeApiSecret) {
-        console.log('');
-        console.log('NODE_API_SECRET was not included in the enrollment JSON.');
-        console.log('Copy it from the management server setup output (setup-management.ps1 prints it once).');
-        config.nodeApiSecret = await question(rl, 'NODE_API_SECRET', process.env.NODE_API_SECRET ?? '');
-      }
 
       console.log('');
       console.log('Enrollment accepted:');
@@ -131,16 +116,13 @@ async function promptForConfig(): Promise<BackendNodeConfig> {
       console.log(`  Node public URL: ${config.nodePublicUrl}`);
       console.log(`  DragonflyDB:     ${config.dragonflyUrl}`);
       console.log(`  Port:            ${config.port}`);
-      console.log(`  NODE_API_SECRET: ${config.nodeApiSecret ? '(set)' : '(MISSING — node will be rejected by management)'}`);
+      console.log('');
+      console.log('The node will receive a Vault-issued mTLS certificate on first registration.');
+      console.log('All management server calls will use that certificate — no shared secrets required.');
       return config;
     }
 
     // Individual-field mode
-    const nodeApiSecret = await question(rl, 'NODE_API_SECRET (from management server setup)', process.env.NODE_API_SECRET ?? '');
-    if (!nodeApiSecret || nodeApiSecret.length < 32) {
-      console.warn('[WARN] NODE_API_SECRET is empty or too short — requests to the management server will be rejected.');
-    }
-
     return {
       port: await question(rl, 'Port', process.env.PORT || '4200'),
       managementUrl: await question(rl, 'Management URL', process.env.MANAGEMENT_URL || 'http://localhost:4100'),
@@ -150,7 +132,6 @@ async function promptForConfig(): Promise<BackendNodeConfig> {
       dragonflyUrl: await question(rl, 'DragonflyDB URL', process.env.DRAGONFLY_URL || 'redis://localhost:6380'),
       tenantId: process.env.TENANT_ID || 'default',
       packageCachePath: process.env.PACKAGE_CACHE_PATH || './package-cache',
-      nodeApiSecret,
       corsAllowedOrigins: await question(rl, 'CORS_ALLOWED_ORIGINS (comma-separated, leave blank to disable)', process.env.CORS_ALLOWED_ORIGINS ?? ''),
     };
   } finally {
@@ -175,10 +156,9 @@ function configFromEnrollment(enrollment: CompleteEnrollmentJson): BackendNodeCo
     nodeId: enrollment.nodeId,
     nodeEnrollmentToken: enrollment.nodeEnrollmentToken,
     nodePublicUrl: enrollment.nodePublicUrl,
-    dragonflyUrl: enrollment.dragonflyUrl,
+    dragonflyUrl: enrollment.dragonflyUrl ?? '',
     tenantId: process.env.TENANT_ID || 'default',
     packageCachePath: process.env.PACKAGE_CACHE_PATH || './package-cache',
-    nodeApiSecret: enrollment.nodeApiSecret ?? process.env.NODE_API_SECRET ?? '',
     corsAllowedOrigins: process.env.CORS_ALLOWED_ORIGINS ?? '',
   };
 }
@@ -237,7 +217,6 @@ function parseEnrollmentJson(value: string): CompleteEnrollmentJson | undefined 
     if (!parsed.managementUrl || !parsed.nodeId || !parsed.nodeEnrollmentToken || !parsed.nodePublicUrl) {
       return undefined;
     }
-    // dragonflyUrl is allowed to be blank here — wizard will prompt for it
     return { ...parsed, dragonflyUrl: parsed.dragonflyUrl ?? '' } as CompleteEnrollmentJson;
   } catch {
     return undefined;
@@ -295,8 +274,9 @@ function writeConfig(config: BackendNodeConfig) {
       `TENANT_ID=${config.tenantId}`,
       `DRAGONFLY_URL=${config.dragonflyUrl}`,
       `PACKAGE_CACHE_PATH=${config.packageCachePath}`,
-      `NODE_API_SECRET=${config.nodeApiSecret}`,
       `CORS_ALLOWED_ORIGINS=${config.corsAllowedOrigins}`,
+      `# NODE_DECOMMISSION_TOKEN_HASH is written automatically after first registration`,
+      `NODE_DECOMMISSION_TOKEN_HASH=`,
       '',
     ].join('\n'),
     'utf8',
@@ -313,7 +293,6 @@ function applyConfig(config: BackendNodeConfig) {
   process.env.TENANT_ID = config.tenantId;
   process.env.DRAGONFLY_URL = config.dragonflyUrl;
   process.env.PACKAGE_CACHE_PATH = config.packageCachePath;
-  process.env.NODE_API_SECRET = config.nodeApiSecret;
   process.env.CORS_ALLOWED_ORIGINS = config.corsAllowedOrigins;
 }
 
@@ -322,13 +301,11 @@ async function registerConfiguredNode() {
   if (!managementUrl) return;
   const registerUrl = `${managementUrl.replace(/\/$/, '')}/nodes/register`;
   console.log(`Registering backend node with management at ${registerUrl}...`);
+  console.log('Note: no shared secret is sent — the enrollment token is the sole credential for this call.');
   try {
     const res = await fetch(registerUrl, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-node-api-secret': process.env.NODE_API_SECRET ?? '',
-      },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         nodeId: process.env.NODE_ID,
         enrollmentToken: process.env.NODE_ENROLLMENT_TOKEN,
@@ -338,7 +315,14 @@ async function registerConfiguredNode() {
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`${res.status} ${text || res.statusText}`);
+    const body = JSON.parse(text) as { nodeId?: string; tls?: unknown; decommissionToken?: string };
     console.log('Registration succeeded. Management accepted this backend node.');
+    if (body.tls) {
+      console.log('mTLS certificate received — it will be persisted to ./tls/ on next full startup.');
+    }
+    if (body.decommissionToken) {
+      console.log('Per-node decommission token received — it will be stored in .env on next full startup.');
+    }
   } catch (error) {
     console.error(`Registration failed: ${error instanceof Error ? error.message : String(error)}`);
     console.error('The node will start and retry automatic registration on startup.');
