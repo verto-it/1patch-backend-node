@@ -16,7 +16,24 @@ const envelope = (deviceId: string): SignedEnvelope<TaskBundle> => ({
   issuedAt: '2026-05-03T00:00:00.000Z',
   expiresAt: '2026-05-03T00:10:00.000Z',
   nonce: deviceId,
-  payload: { tasks: [{ id: `task-${deviceId}`, deviceId, type: 'refresh_inventory', targetVersion: 'latest', createdAt: '2026-05-03T00:00:00.000Z' }] },
+  payload: {
+    tasks: [{ id: `task-${deviceId}`, deviceId, type: 'refresh_inventory', targetVersion: 'latest', createdAt: '2026-05-03T00:00:00.000Z' }],
+    ledgerEntry: {
+      ledgerId: `ledger-${deviceId}`,
+      taskId: `task-${deviceId}`,
+      tenantId: 'default',
+      createdBy: 'user-1',
+      createdAt: '2026-05-03T00:00:00.000Z',
+      visibleInDashboard: true,
+      taskHash: 'hash',
+      riskScore: 0,
+      notBefore: '2026-05-03T00:00:00.000Z',
+      expiresAt: '2026-05-03T00:10:00.000Z',
+      keyId: 'main',
+      signature: 'ledger-signature',
+      state: 'active',
+    },
+  },
   signature: 'signature',
 });
 

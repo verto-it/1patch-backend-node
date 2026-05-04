@@ -297,13 +297,14 @@ export class ManagementService implements OnApplicationBootstrap {
    * NODE_API_SECRET / x-node-api-secret is never set on any request.
    */
   private managementFetch(url: string, init?: RequestInit): Promise<Response> {
+    const requestInit = withNodeIdHeader(init);
     if (this.mtlsAgent) {
       return undiciFetch(
         url,
-        { ...init, dispatcher: this.mtlsAgent } as Parameters<typeof undiciFetch>[1],
+        { ...requestInit, dispatcher: this.mtlsAgent } as Parameters<typeof undiciFetch>[1],
       ) as unknown as Promise<Response>;
     }
-    return fetch(url, init);
+    return fetch(url, requestInit);
   }
 
   /** Reads cert/key/ca from disk and builds a fresh undici mTLS Agent. */
@@ -356,4 +357,13 @@ export class ManagementService implements OnApplicationBootstrap {
       await writeFile(envPath, `${existing.trimEnd()}\n${KEY}=${decommissionToken}\n`, 'utf8');
     }
   }
+}
+
+function withNodeIdHeader(init?: RequestInit): RequestInit | undefined {
+  const nodeId = process.env.NODE_ID;
+  if (!nodeId) return init;
+
+  const headers = new Headers(init?.headers);
+  if (!headers.has('x-node-id')) headers.set('x-node-id', nodeId);
+  return { ...init, headers };
 }
