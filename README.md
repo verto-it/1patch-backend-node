@@ -8,6 +8,21 @@ NestJS data and command plane for 1Patch. Clients communicate with backend nodes
 
 ---
 
+## Source Map
+
+For implementation details, see [`src/README.md`](src/README.md).
+
+| Path | Responsibility |
+|---|---|
+| `src/agent/` | Client registration, heartbeat, inventory, task polling, task result intake |
+| `src/management/` | Node registration, mTLS client certificate persistence, management sync |
+| `src/queue/` | Durable Dragonfly-backed event queue |
+| `src/tasks/` | Signed task bundle storage and per-device dispatch |
+| `src/packages/` | Package cache status and streaming downloads |
+| `src/node-control.controller.ts` | Decommission endpoint called by management |
+
+---
+
 ## Prerequisites
 
 - Node.js 20 LTS or 22 LTS

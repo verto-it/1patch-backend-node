@@ -11,6 +11,9 @@ export class DragonflyService implements OnModuleDestroy {
   private hasEverConnected = false;
   private isConnected = false;
 
+  /**
+   * Creates a DragonflyService instance with its required collaborators.
+   */
   constructor() {
     this.url = process.env.DRAGONFLY_URL;
     if (!this.url) {
@@ -20,12 +23,19 @@ export class DragonflyService implements OnModuleDestroy {
     this.client = this.createClient();
   }
 
+  /**
+   * Creates a client record.
+   * @returns The result produced by the operation.
+   */
   private createClient() {
     const client = new Redis(this.url!, {
       connectTimeout: 2000,
       enableOfflineQueue: false,
       lazyConnect: true,
       maxRetriesPerRequest: 1,
+      /**
+       * Handles the retry strategy operation for DragonflyService.
+       */
       retryStrategy: () => null,
     });
     client.on('error', (error) => {
@@ -34,6 +44,12 @@ export class DragonflyService implements OnModuleDestroy {
     return client;
   }
 
+  /**
+   * Handles the lpush json operation for DragonflyService.
+   *
+   * @param key key supplied to the function.
+   * @param value Value to read, render, or store.
+   */
   async lpushJson(key: string, value: unknown) {
     if (!this.client) return;
     if (!(await this.ensureConnected())) return;
@@ -45,6 +61,12 @@ export class DragonflyService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Handles the rpop json operation for DragonflyService.
+   *
+   * @param key key supplied to the function.
+   * @returns The result produced by the operation.
+   */
   async rpopJson<T>(key: string): Promise<T | undefined> {
     if (!this.client) return undefined;
     if (!(await this.ensureConnected())) return undefined;
@@ -58,6 +80,12 @@ export class DragonflyService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Handles the llen operation for DragonflyService.
+   *
+   * @param key key supplied to the function.
+   * @returns The result produced by the operation.
+   */
   async llen(key: string) {
     if (!this.client) return 0;
     if (!(await this.ensureConnected())) return 0;
@@ -71,6 +99,12 @@ export class DragonflyService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Sets the json value.
+   *
+   * @param key key supplied to the function.
+   * @param value Value to read, render, or store.
+   */
   async setJson(key: string, value: unknown) {
     if (!this.client) return;
     if (!(await this.ensureConnected())) return;
@@ -82,6 +116,12 @@ export class DragonflyService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Gets the json value.
+   *
+   * @param key key supplied to the function.
+   * @returns The result produced by the operation.
+   */
   async getJson<T>(key: string): Promise<T | undefined> {
     if (!this.client) return undefined;
     if (!(await this.ensureConnected())) return undefined;
@@ -95,6 +135,10 @@ export class DragonflyService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Handles the health operation for DragonflyService.
+   * @returns The result produced by the operation.
+   */
   async health() {
     const ready = await this.ensureConnected();
     return {
@@ -105,10 +149,17 @@ export class DragonflyService implements OnModuleDestroy {
     };
   }
 
+  /**
+   * Handles the on module destroy operation for DragonflyService.
+   */
   async onModuleDestroy() {
     if (this.client?.status === 'ready') await this.client.quit();
   }
 
+  /**
+   * Resolves connected configuration.
+   * @returns The result produced by the operation.
+   */
   private async ensureConnected() {
     if (!this.client) return false;
     if (this.client.status === 'ready') return true;
@@ -131,6 +182,11 @@ export class DragonflyService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Handles the record unavailable operation for DragonflyService.
+   *
+   * @param error Error raised by the preceding operation.
+   */
   private recordUnavailable(error: unknown) {
     this.lastError = error instanceof Error ? error.message : String(error);
     this.isConnected = false;

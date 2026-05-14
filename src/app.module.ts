@@ -6,6 +6,7 @@ import { HealthController } from './health.controller';
 import { ManagementService } from './management/management.service';
 import { NodeControlController } from './node-control.controller';
 import { PackageCacheService } from './packages/package-cache.service';
+import { NodeSigningService } from './node-signing.service';
 import { PackagesController } from './packages/packages.controller';
 import { EventQueueService } from './queue/event-queue.service';
 import { DragonflyService } from './storage/dragonfly.service';
@@ -16,6 +17,6 @@ import { DeviceAuthGuard } from './agent/device-auth.guard';
 @Module({
   imports: [ConfigModule.forRoot({ isGlobal: true }), ScheduleModule.forRoot()],
   controllers: [AgentController, HealthController, NodeControlController, PackagesController],
-  providers: [DragonflyService, EventQueueService, PackageCacheService, ManagementService, TaskStore, DeviceKeyStore, DeviceAuthGuard],
+  providers: [DragonflyService, EventQueueService, PackageCacheService, NodeSigningService, ManagementService, TaskStore, DeviceKeyStore, DeviceAuthGuard],
 })
 export class AppModule {}

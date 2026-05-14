@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
@@ -18,16 +19,20 @@ type EnrollmentJson = {
   managementUrl?: string;
   nodePublicUrl?: string;
   nodeId?: string;
-  nodeEnrollmentToken?: string;
+  enrollmentToken?: string;
   dragonflyUrl?: string;
+  caCert?: string;
 };
 
-type CompleteEnrollmentJson = Required<Omit<EnrollmentJson, 'dragonflyUrl'>> & Pick<EnrollmentJson, 'dragonflyUrl'>;
+type CompleteEnrollmentJson = Required<Omit<EnrollmentJson, 'dragonflyUrl' | 'caCert'>> & Pick<EnrollmentJson, 'dragonflyUrl' | 'caCert'>;
 
 const envPath = '.env';
 const defaultBackendNodePort = process.env.DEFAULT_BACKEND_NODE_PORT || '4200';
 
 
+/**
+ * Resolves console setup configuration.
+ */
 export async function ensureConsoleSetup() {
   console.log('Checking backend node configuration...');
   loadEnvFile();
@@ -55,11 +60,12 @@ export async function ensureConsoleSetup() {
   writeConfig(config);
   console.log('Applying backend node configuration to this process...');
   applyConfig(config);
-
-  const shouldRegister = await promptYesNo('Register this backend node with management now?', true);
-  if (shouldRegister) await registerConfiguredNode();
+  console.log('Node will register with the management server on startup.');
 }
 
+/**
+ * Loads env file data.
+ */
 function loadEnvFile() {
   if (!existsSync(envPath)) return;
   const content = readFileSync(envPath, 'utf8');
@@ -71,6 +77,10 @@ function loadEnvFile() {
   }
 }
 
+/**
+ * Handles the has required config operation.
+ * @returns The result produced by the operation.
+ */
 function hasRequiredConfig() {
   return Boolean(
     process.env.NODE_ID &&
@@ -81,21 +91,29 @@ function hasRequiredConfig() {
   );
 }
 
+/**
+ * Handles the prompt for config operation.
+ * @returns The result produced by the operation.
+ */
 async function promptForConfig(): Promise<BackendNodeConfig> {
   const rl = createInterface({ input, output });
   try {
     console.log('');
-    console.log('1Patch Backend Node Console Setup');
+    console.log('1Patch Backend Node Setup');
     console.log('---------------------------------');
-    console.log('Create an enrollment in the management dashboard, then choose how to enter it.');
+    console.log('Create a node enrollment in the management dashboard, then paste the JSON below.');
     console.log('');
 
     const mode = await chooseSetupMode(rl);
     if (mode === 'json') {
       const enrollment = await promptForEnrollmentJson(rl);
 
+      if (!enrollment.dragonflyUrl) {
+        enrollment.dragonflyUrl = await question(rl, 'DragonflyDB URL', process.env.DRAGONFLY_URL || 'redis://localhost:6380');
+      }
+
       if (sameOrigin(enrollment.managementUrl, enrollment.nodePublicUrl)) {
-        console.log('Node public URL matches the management URL. The backend node needs its own URL.');
+        console.log('Note: node public URL matches the management URL — the backend node needs its own address.');
         enrollment.nodePublicUrl = await question(
           rl,
           'Node public URL',
@@ -103,22 +121,14 @@ async function promptForConfig(): Promise<BackendNodeConfig> {
         );
       }
 
-      if (!enrollment.dragonflyUrl) {
-        enrollment.dragonflyUrl = await question(rl, 'DragonflyDB URL', process.env.DRAGONFLY_URL || 'redis://localhost:6380');
-      }
-
       const config = configFromEnrollment(enrollment);
-
+      persistCaCert(enrollment.caCert);
       console.log('');
-      console.log('Enrollment accepted:');
       console.log(`  Node ID:         ${config.nodeId}`);
       console.log(`  Management URL:  ${config.managementUrl}`);
       console.log(`  Node public URL: ${config.nodePublicUrl}`);
       console.log(`  DragonflyDB:     ${config.dragonflyUrl}`);
-      console.log(`  Port:            ${config.port}`);
       console.log('');
-      console.log('The node will receive a Vault-issued mTLS certificate on first registration.');
-      console.log('All management server calls will use that certificate — no shared secrets required.');
       return config;
     }
 
@@ -132,13 +142,19 @@ async function promptForConfig(): Promise<BackendNodeConfig> {
       dragonflyUrl: await question(rl, 'DragonflyDB URL', process.env.DRAGONFLY_URL || 'redis://localhost:6380'),
       tenantId: process.env.TENANT_ID || 'default',
       packageCachePath: process.env.PACKAGE_CACHE_PATH || './package-cache',
-      corsAllowedOrigins: await question(rl, 'CORS_ALLOWED_ORIGINS (comma-separated, leave blank to disable)', process.env.CORS_ALLOWED_ORIGINS ?? ''),
+      corsAllowedOrigins: await question(rl, 'CORS allowed origins (comma-separated, blank to skip)', process.env.CORS_ALLOWED_ORIGINS ?? ''),
     };
   } finally {
     rl.close();
   }
 }
 
+/**
+ * Handles the backend node url from management operation.
+ *
+ * @param managementUrl URL used by the operation.
+ * @returns The result produced by the operation.
+ */
 function backendNodeUrlFromManagement(managementUrl: string) {
   try {
     const url = new URL(managementUrl);
@@ -149,12 +165,18 @@ function backendNodeUrlFromManagement(managementUrl: string) {
   }
 }
 
+/**
+ * Handles the config from enrollment operation.
+ *
+ * @param enrollment enrollment supplied to the function.
+ * @returns The result produced by the operation.
+ */
 function configFromEnrollment(enrollment: CompleteEnrollmentJson): BackendNodeConfig {
   return {
     port: portFromUrl(enrollment.nodePublicUrl) || process.env.PORT || '4200',
     managementUrl: enrollment.managementUrl,
     nodeId: enrollment.nodeId,
-    nodeEnrollmentToken: enrollment.nodeEnrollmentToken,
+    nodeEnrollmentToken: enrollment.enrollmentToken,
     nodePublicUrl: enrollment.nodePublicUrl,
     dragonflyUrl: enrollment.dragonflyUrl ?? '',
     tenantId: process.env.TENANT_ID || 'default',
@@ -163,6 +185,12 @@ function configFromEnrollment(enrollment: CompleteEnrollmentJson): BackendNodeCo
   };
 }
 
+/**
+ * Handles the port from url operation.
+ *
+ * @param value Value to read, render, or store.
+ * @returns The result produced by the operation.
+ */
 function portFromUrl(value: string) {
   try {
     const url = new URL(value);
@@ -173,6 +201,13 @@ function portFromUrl(value: string) {
   }
 }
 
+/**
+ * Handles the same origin operation.
+ *
+ * @param left left supplied to the function.
+ * @param right right supplied to the function.
+ * @returns The result produced by the operation.
+ */
 function sameOrigin(left: string, right: string) {
   try {
     return new URL(left).origin === new URL(right).origin;
@@ -195,34 +230,73 @@ async function promptForEnrollmentJson(rl: ReturnType<typeof createInterface>): 
     const pasted = await readJsonBlock(rl);
     const enrollment = parseEnrollmentJson(pasted);
     if (enrollment) return enrollment;
-    console.log('Could not parse enrollment JSON. Paste the full JSON object again, then press Enter on a blank line.');
+    console.log('');
   }
 }
 
 async function readJsonBlock(rl: ReturnType<typeof createInterface>) {
+  console.log('Paste enrollment JSON from the management dashboard:');
   const lines: string[] = [];
-  console.log('Paste enrollment JSON (from the management dashboard), then press Enter on a blank line.');
   while (true) {
     const line = await rl.question(lines.length === 0 ? 'Enrollment JSON: ' : '');
-    if (!line.trim() && lines.length > 0) return lines.join('\n');
+    if (line.length === 0 && lines.length > 0) break;
+    if (line.length === 0) continue;
     lines.push(line);
+    if (looksCompleteJson(lines.join('\n'))) break;
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Returns true when value contains a syntactically complete JSON object.
+ *
+ * @param value Value to check.
+ * @returns The result produced by the operation.
+ */
+function looksCompleteJson(value: string) {
+  const start = value.indexOf('{');
+  const end = value.lastIndexOf('}');
+  if (start < 0 || end <= start) return false;
+  try {
+    JSON.parse(value.slice(start, end + 1));
+    return true;
+  } catch {
+    return false;
   }
 }
 
+/**
+ * Parses enrollment json input.
+ *
+ * @param value Value to read, render, or store.
+ * @returns The result produced by the operation.
+ */
 function parseEnrollmentJson(value: string): CompleteEnrollmentJson | undefined {
   const trimmed = extractJsonObject(value);
-  if (!trimmed) return undefined;
+  if (!trimmed) {
+    console.log('No JSON object found in the pasted text.');
+    return undefined;
+  }
   try {
     const parsed = JSON.parse(trimmed) as EnrollmentJson;
-    if (!parsed.managementUrl || !parsed.nodeId || !parsed.nodeEnrollmentToken || !parsed.nodePublicUrl) {
+    const missing = (['managementUrl', 'nodeId', 'enrollmentToken', 'nodePublicUrl'] as const).filter((k) => !parsed[k]);
+    if (missing.length > 0) {
+      console.log(`Enrollment JSON is missing required fields: ${missing.join(', ')}`);
       return undefined;
     }
     return { ...parsed, dragonflyUrl: parsed.dragonflyUrl ?? '' } as CompleteEnrollmentJson;
   } catch {
+    console.log('Could not parse pasted text as JSON.');
     return undefined;
   }
 }
 
+/**
+ * Handles the extract json object operation.
+ *
+ * @param value Value to read, render, or store.
+ * @returns The result produced by the operation.
+ */
 function extractJsonObject(value: string) {
   const start = value.indexOf('{');
   if (start === -1) return undefined;
@@ -244,24 +318,25 @@ function extractJsonObject(value: string) {
   return undefined;
 }
 
+/**
+ * Handles the question operation.
+ *
+ * @param rl rl supplied to the function.
+ * @param label label supplied to the function.
+ * @param defaultValue default value supplied to the function.
+ * @returns The result produced by the operation.
+ */
 async function question(rl: ReturnType<typeof createInterface>, label: string, defaultValue = '') {
   const suffix = defaultValue ? ` [${defaultValue}]` : '';
   const answer = (await rl.question(`${label}${suffix}: `)).trim();
   return answer || defaultValue;
 }
 
-async function promptYesNo(label: string, defaultValue: boolean) {
-  const rl = createInterface({ input, output });
-  try {
-    const suffix = defaultValue ? 'Y/n' : 'y/N';
-    const answer = (await rl.question(`${label} [${suffix}]: `)).trim().toLowerCase();
-    if (!answer) return defaultValue;
-    return answer === 'y' || answer === 'yes';
-  } finally {
-    rl.close();
-  }
-}
-
+/**
+ * Handles the write config operation.
+ *
+ * @param config Configuration object used by the operation.
+ */
 function writeConfig(config: BackendNodeConfig) {
   writeFileSync(
     envPath,
@@ -284,6 +359,11 @@ function writeConfig(config: BackendNodeConfig) {
   console.log('Wrote backend node .env successfully.');
 }
 
+/**
+ * Handles the apply config operation.
+ *
+ * @param config Configuration object used by the operation.
+ */
 function applyConfig(config: BackendNodeConfig) {
   process.env.PORT = config.port;
   process.env.NODE_ID = config.nodeId;
@@ -296,35 +376,11 @@ function applyConfig(config: BackendNodeConfig) {
   process.env.CORS_ALLOWED_ORIGINS = config.corsAllowedOrigins;
 }
 
-async function registerConfiguredNode() {
-  const managementUrl = process.env.MANAGEMENT_URL;
-  if (!managementUrl) return;
-  const registerUrl = `${managementUrl.replace(/\/$/, '')}/nodes/register`;
-  console.log(`Registering backend node with management at ${registerUrl}...`);
-  console.log('Note: no shared secret is sent — the enrollment token is the sole credential for this call.');
+function persistCaCert(caCert: string | undefined) {
+  if (!caCert) return;
   try {
-    const res = await fetch(registerUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        nodeId: process.env.NODE_ID,
-        enrollmentToken: process.env.NODE_ENROLLMENT_TOKEN,
-        version: '0.1.0',
-        capacity: { packageCache: 'local' },
-      }),
-    });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`${res.status} ${text || res.statusText}`);
-    const body = JSON.parse(text) as { nodeId?: string; tls?: unknown; decommissionToken?: string };
-    console.log('Registration succeeded. Management accepted this backend node.');
-    if (body.tls) {
-      console.log('mTLS certificate received — it will be persisted to ./tls/ on next full startup.');
-    }
-    if (body.decommissionToken) {
-      console.log('Per-node decommission token received — it will be stored in .env on next full startup.');
-    }
-  } catch (error) {
-    console.error(`Registration failed: ${error instanceof Error ? error.message : String(error)}`);
-    console.error('The node will start and retry automatic registration on startup.');
-  }
+    const tlsDir = join(process.cwd(), 'tls');
+    mkdirSync(tlsDir, { recursive: true });
+    writeFileSync(join(tlsDir, 'ca.crt'), caCert, { encoding: 'utf8', mode: 0o644 });
+  } catch { /* non-fatal */ }
 }

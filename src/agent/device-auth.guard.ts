@@ -33,9 +33,20 @@ export class DeviceAuthGuard implements CanActivate {
   private readonly logger = new Logger(DeviceAuthGuard.name);
   private static readonly CLOCK_SKEW_MS = 5 * 60_000;
 
+  /**
+   * Creates a DeviceAuthGuard instance with its required collaborators.
+   *
+   * @param keys keys supplied to the function.
+   */
   constructor(private readonly keys: DeviceKeyStore) {}
 
   
+  /**
+   * Validates can activate rules.
+   *
+   * @param context context supplied to the function.
+   * @returns The result produced by the operation.
+   */
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const req = context.switchToHttp().getRequest<RequestLike>();
 
@@ -81,8 +92,11 @@ export class DeviceAuthGuard implements CanActivate {
     }
 
     // Verify signature
-    const bodyText = req.body === undefined || req.body === null ? "" : JSON.stringify(req.body);
-    const bodyHash = createHash("sha256").update(bodyText).digest("hex");
+    // Use the raw request bytes captured by the body-parser verify callback.
+    // Re-serialising req.body produces different bytes than what the client signed
+    // (different key order, and GET requests have no body but req.body is {}).
+    const rawBody = (req as unknown as Record<string, unknown>)['rawBody'] as Buffer | undefined;
+    const bodyHash = createHash("sha256").update(rawBody ?? Buffer.alloc(0)).digest("hex");
     const path = req.originalUrl ?? req.url ?? req.path;
     const canonical = `${req.method}|${path}|${deviceId}|${ts}|${bodyHash}`;
 

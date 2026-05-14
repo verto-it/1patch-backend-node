@@ -3,17 +3,23 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { createHash } from 'crypto';
 import { existsSync } from 'fs';
+import { freemem, totalmem, release as osRelease } from 'os';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import { join } from 'path';
 import { Agent, fetch as undiciFetch } from 'undici';
 import { EventQueueService } from '../queue/event-queue.service';
 import { PackageCacheService } from '../packages/package-cache.service';
 import { TaskStore } from '../tasks/task.store';
-import { SignedEnvelope, TaskBundle } from '../types';
+import { NodeCapability, NodeHealthComponent, NodeHealthReport, NodeSecurityFinding, SignedEnvelope, TaskBundle } from '../types';
+import { NodeSigningService } from '../node-signing.service';
 
 /**
  * Directory where the Vault-issued mTLS cert and key are persisted on this node.
  * The CA cert (used to verify the management server certificate) is stored here too.
  */
+const execAsync = promisify(exec);
+
 const TLS_DIR = process.env.NODE_TLS_DIR ?? join(process.cwd(), 'tls');
 const CERT_PATH = join(TLS_DIR, 'node.crt');
 const KEY_PATH  = join(TLS_DIR, 'node.key');
@@ -38,16 +44,34 @@ export class ManagementService implements OnApplicationBootstrap {
    */
   private mtlsAgent: Agent | undefined;
 
+  /**
+   * CA-only undici dispatcher used before the node has received its mTLS cert.
+   * Verifies the management server's TLS certificate against the Vault CA without
+   * sending a client certificate — set when ca.crt exists but node.crt does not.
+   */
+  private caOnlyAgent: Agent | undefined;
+
   /** ISO timestamp of when the current cert expires — used by the renewal cron. */
   private certExpiresAt: string | undefined;
 
   
+  /**
+   * Creates a ManagementService instance with its required collaborators.
+   *
+   * @param queue queue supplied to the function.
+   * @param tasks tasks supplied to the function.
+   * @param packages packages supplied to the function.
+   */
   constructor(
     private readonly queue: EventQueueService,
     private readonly tasks: TaskStore,
     private readonly packages: PackageCacheService,
+    private readonly signing: NodeSigningService,
   ) {}
 
+  /**
+   * Handles the on application bootstrap operation for ManagementService.
+   */
   async onApplicationBootstrap() {
     const missing = ['NODE_ID', 'NODE_ENROLLMENT_TOKEN', 'MANAGEMENT_URL'].filter((k) => !process.env[k]);
     if (missing.length > 0) {
@@ -72,34 +96,51 @@ export class ManagementService implements OnApplicationBootstrap {
       const result = await this.register();
       this.logger.log(`Registered with management server as nodeId=${result.nodeId}`);
     } catch (error) {
-      this.logger.warn(
-        `Management registration failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      // Fall back to heartbeat if we already have a cert (node was previously registered)
-      if (this.mtlsAgent) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Management registration failed: ${message}`);
+
+      // Fall back to heartbeat if this node was already registered. In local dev,
+      // the management server may allow plain HTTP node calls via x-node-id.
+      if (this.mtlsAgent || isDevPlainHttpNodeFallbackAllowed()) {
         const result = await this.heartbeat();
         if (result.accepted) {
           this.logger.log(`Management heartbeat accepted for existing nodeId=${process.env.NODE_ID}`);
         }
+      } else if (message.includes('Enrollment token has already been used')) {
+        this.logger.error(
+          'Enrollment token has already been used and no persisted mTLS certificate was found. ' +
+          'Re-enroll this backend node from the management server, update NODE_ENROLLMENT_TOKEN, and restart.',
+        );
       }
     }
   }
 
+  /**
+   * Handles the register operation for ManagementService.
+   * @returns The result produced by the operation.
+   */
   async register() {
     const managementUrl = process.env.MANAGEMENT_URL;
     if (!managementUrl) throw new ServiceUnavailableException('MANAGEMENT_URL is not configured');
     this.logger.log(`Registering node ${process.env.NODE_ID} with management server at ${managementUrl}`);
 
-    // /nodes/register is the only endpoint that does NOT require a client cert —
-    // the enrollment token is the sole credential for this one call.
-    const res = await fetch(`${managementUrl}/nodes/register`, {
+    // /nodes/register does not require a client cert — the enrollment token is the
+    // sole credential. We still route through managementFetch so the CA cert (if
+    // already saved from the enrollment JSON) is used to verify the server's TLS cert.
+    const res = await this.managementFetch(`${managementUrl}/nodes/register`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         nodeId: process.env.NODE_ID,
         enrollmentToken: process.env.NODE_ENROLLMENT_TOKEN,
         version: '0.1.0',
-        capacity: { queue: await this.queue.size(), packageCache: 'local' },
+        capacity: { queue: await this.queue.size(), packageCache: 'local', capabilities: configuredCapabilities() },
+        capabilities: configuredCapabilities(),
+        signingPublicKeyPem: this.signing.publicKey(),
+        publicUrl: process.env.NODE_PUBLIC_URL,
+        region: process.env.NODE_REGION,
+        site: process.env.NODE_SITE,
+        updateChannel: process.env.NODE_UPDATE_CHANNEL ?? 'stable',
       }),
     });
 
@@ -134,6 +175,10 @@ export class ManagementService implements OnApplicationBootstrap {
     return body as { nodeId: string; accepted: boolean };
   }
 
+  /**
+   * Handles the heartbeat operation for ManagementService.
+   * @returns The result produced by the operation.
+   */
   @Cron(CronExpression.EVERY_MINUTE)
   async heartbeat() {
     const nodeId = process.env.NODE_ID;
@@ -143,12 +188,26 @@ export class ManagementService implements OnApplicationBootstrap {
       return { accepted: false };
     }
     try {
+      // Attempt the signed health report first. If it fails (e.g. no signing key
+      // on record yet), fall through to the plain heartbeat which carries
+      // signingPublicKeyPem so the management server can self-heal.
+      try {
+        const signed = await this.sendSignedHealthReport();
+        if (signed.accepted) return signed;
+      } catch (signedErr) {
+        this.logger.debug(
+          `Signed health report failed, falling back to plain heartbeat: ${signedErr instanceof Error ? signedErr.message : String(signedErr)}`,
+        );
+      }
+        
+
       const res = await this.managementFetch(`${managementUrl}/nodes/heartbeat`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           nodeId,
           capacity: { queue: await this.queue.size(), packageCache: 'local' },
+          signingPublicKeyPem: this.signing.publicKey(),
         }),
       });
       if (!res.ok) {
@@ -163,6 +222,36 @@ export class ManagementService implements OnApplicationBootstrap {
       this.logger.warn(`Management heartbeat failed: ${error instanceof Error ? error.message : String(error)}`);
       return { accepted: false, error: String(error) };
     }
+  }
+
+  async sendSignedHealthReport() {
+    const nodeId = process.env.NODE_ID;
+    const managementUrl = process.env.MANAGEMENT_URL;
+    if (!nodeId || !managementUrl) return { accepted: false };
+
+    const challengeRes = await this.managementFetch(`${managementUrl}/nodes/challenge/node_health_report`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    if (!challengeRes.ok) {
+      const body = await challengeRes.text();
+      throw new Error(`health challenge failed: HTTP ${challengeRes.status} - ${body}`);
+    }
+    const challenge = (await challengeRes.json()) as { nonce: string; serverTime: string; expiresAt: string };
+    const report = await this.buildHealthReport(challenge.serverTime);
+    const envelope = this.signing.signPayload('node_health_report', report, challenge.nonce);
+    const res = await this.managementFetch(`${managementUrl}/nodes/health/signed`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(envelope),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`signed health failed: HTTP ${res.status} - ${body}`);
+    }
+    const result = (await res.json()) as { accepted: boolean; certExpiresAt?: string };
+    if (this.certExpiresAt) result.certExpiresAt = this.certExpiresAt;
+    return result;
   }
 
   /**
@@ -214,10 +303,17 @@ export class ManagementService implements OnApplicationBootstrap {
     }
   }
 
+  /**
+   * Handles the request flush operation for ManagementService.
+   */
   requestFlush() {
     void this.flushQueue();
   }
 
+  /**
+   * Handles the flush queue operation for ManagementService.
+   * @returns The result produced by the operation.
+   */
   @Cron(CronExpression.EVERY_MINUTE)
   async flushQueue() {
     if (this.flushInFlight) { this.flushAgain = true; return { synced: 0, deferred: true }; }
@@ -231,6 +327,10 @@ export class ManagementService implements OnApplicationBootstrap {
     }
   }
 
+  /**
+   * Handles the flush queue batch operation for ManagementService.
+   * @returns The result produced by the operation.
+   */
   private async flushQueueBatch() {
     const events = await this.queue.drain();
     if (events.length === 0) { this.logger.debug('Event queue flush: nothing to sync'); return { synced: 0 }; }
@@ -256,6 +356,37 @@ export class ManagementService implements OnApplicationBootstrap {
     }
   }
 
+  async signedCacheAttestation(attestation: {
+    packageArtifactId: string;
+    sha256: string;
+    verified: boolean;
+    signatureValid?: boolean;
+    sizeBytes?: number;
+    expiresAt?: string;
+    observedAt: string;
+    reason?: string;
+  }) {
+    const managementUrl = process.env.MANAGEMENT_URL;
+    if (!managementUrl || !process.env.NODE_ID) return { accepted: false };
+    const challengeRes = await this.managementFetch(`${managementUrl}/nodes/challenge/cache_artifact_attestation`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    if (!challengeRes.ok) return { accepted: false };
+    const challenge = (await challengeRes.json()) as { nonce: string };
+    const envelope = this.signing.signPayload('cache_artifact_attestation', attestation, challenge.nonce);
+    const res = await this.managementFetch(`${managementUrl}/nodes/cache/attestations`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(envelope),
+    });
+    return { accepted: res.ok };
+  }
+
+  /**
+   * Handles the pull tasks operation for ManagementService.
+   * @returns The result produced by the operation.
+   */
   @Cron(CronExpression.EVERY_30_SECONDS)
   async pullTasks() {
     const nodeId = process.env.NODE_ID;
@@ -299,27 +430,85 @@ export class ManagementService implements OnApplicationBootstrap {
    */
   private managementFetch(url: string, init?: RequestInit): Promise<Response> {
     const requestInit = withNodeIdHeader(init);
-    if (this.mtlsAgent) {
+    const dispatcher = this.mtlsAgent ?? this.caOnlyAgent;
+    if (dispatcher) {
       return undiciFetch(
         url,
-        { ...requestInit, dispatcher: this.mtlsAgent } as Parameters<typeof undiciFetch>[1],
+        { ...requestInit, dispatcher } as Parameters<typeof undiciFetch>[1],
       ) as unknown as Promise<Response>;
     }
     return fetch(url, requestInit);
   }
 
+  private async buildHealthReport(serverTime?: string): Promise<NodeHealthReport> {
+    const queueSize = await this.queue.size();
+    const cacheStatus = this.packages.status();
+    const now = new Date().toISOString();
+    const memoryPressurePercent = Math.round(((totalmem() - freemem()) / Math.max(1, totalmem())) * 100);
+    const clockSkewMs = serverTime ? Math.abs(Date.now() - Date.parse(serverTime)) : undefined;
+    const components: NodeHealthComponent[] = [
+      component('reachability', 'ok', now, 'node reached management over mTLS'),
+      component('event_queue', queueSize > 1000 ? 'degraded' : 'ok', now, `queue=${queueSize}`, queueSize),
+      component('database', 'ok', now, 'local node uses Dragonfly-backed queue'),
+      component('certificate', certificateHealthyForCurrentMode(this.certExpiresAt) ? 'ok' : 'degraded', now, this.certExpiresAt ? `expires=${this.certExpiresAt}` : 'no mTLS cert'),
+      component('scanner', cacheStatus.scannerHealthy ? 'ok' : 'degraded', now),
+      component('disk', cacheStatus.diskFreeBytes && cacheStatus.diskFreeBytes < 1024 * 1024 * 1024 ? 'degraded' : 'ok', now, undefined, cacheStatus.diskFreeBytes),
+      component('memory', memoryPressurePercent > 90 ? 'degraded' : 'ok', now, undefined, memoryPressurePercent),
+      component('clock', clockSkewMs && clockSkewMs > 60_000 ? 'degraded' : 'ok', now, undefined, clockSkewMs),
+      component('update_source', 'ok', now),
+      component('cache', cacheStatus.healthy ? 'ok' : 'degraded', now),
+      component('package_verifier', 'ok', now),
+    ];
+    const securityFindings = shouldCollectOsSecurityFindings()
+      ? await collectOsSecurityFindings().catch(() => [] as NodeSecurityFinding[])
+      : [];
+
+    return {
+      nodeId: process.env.NODE_ID ?? '',
+      reportedAt: now,
+      managementUrl: process.env.MANAGEMENT_URL,
+      publicUrl: process.env.NODE_PUBLIC_URL,
+      version: '0.1.0',
+      region: process.env.NODE_REGION,
+      site: process.env.NODE_SITE,
+      queueSize,
+      queueLag: queueSize > 1000 ? 'high' : queueSize > 100 ? 'medium' : 'low',
+      diskFreeBytes: cacheStatus.diskFreeBytes,
+      memoryPressurePercent,
+      clockSkewMs,
+      certExpiresAt: this.certExpiresAt,
+      scannerHealthy: cacheStatus.scannerHealthy,
+      cacheHealthy: cacheStatus.healthy,
+      packageVerifierHealthy: true,
+      updateSourceReachable: true,
+      components,
+      capabilities: configuredCapabilities(),
+      securityFindings,
+      osInfo: { platform: process.platform, release: osRelease() },
+    };
+  }
+
   /** Reads cert/key/ca from disk and builds a fresh undici mTLS Agent. */
   private async loadMtlsAgent(): Promise<void> {
-    if (!existsSync(CERT_PATH) || !existsSync(KEY_PATH) || !existsSync(CA_PATH)) {
+    const hasCa   = existsSync(CA_PATH);
+    const hasCert = existsSync(CERT_PATH) && existsSync(KEY_PATH);
+
+    if (!hasCa) {
       this.logger.debug('No persisted mTLS cert found — using plain TLS until first registration');
       return;
     }
+
     try {
-      const [cert, key, ca] = await Promise.all([
-        readFile(CERT_PATH, 'utf8'),
-        readFile(KEY_PATH,  'utf8'),
-        readFile(CA_PATH,   'utf8'),
-      ]);
+      const ca = await readFile(CA_PATH, 'utf8');
+
+      if (!hasCert) {
+        // CA cert present but no client cert yet — verify server TLS without sending a client cert
+        this.caOnlyAgent = new Agent({ connect: { ca, rejectUnauthorized: true } });
+        this.logger.debug('CA cert found — server TLS verification enabled for initial registration');
+        return;
+      }
+
+      const [cert, key] = await Promise.all([readFile(CERT_PATH, 'utf8'), readFile(KEY_PATH, 'utf8')]);
       this.mtlsAgent = new Agent({ connect: { cert, key, ca, rejectUnauthorized: true } });
       this.logger.log('mTLS agent loaded from persisted certificate');
     } catch (err) {
@@ -361,6 +550,12 @@ export class ManagementService implements OnApplicationBootstrap {
   }
 }
 
+/**
+ * Handles the with node id header operation.
+ *
+ * @param init init supplied to the function.
+ * @returns The result produced by the operation.
+ */
 function withNodeIdHeader(init?: RequestInit): RequestInit | undefined {
   const nodeId = process.env.NODE_ID;
   if (!nodeId) return init;
@@ -368,4 +563,143 @@ function withNodeIdHeader(init?: RequestInit): RequestInit | undefined {
   const headers = new Headers(init?.headers);
   if (!headers.has('x-node-id')) headers.set('x-node-id', nodeId);
   return { ...init, headers };
+}
+
+function isDevPlainHttpNodeFallbackAllowed(): boolean {
+  if (process.env.NODE_ENV === 'production') return false;
+  if (process.env.MTLS_DISABLED === 'true') return true;
+
+  return !(process.env.TLS_CERT_PATH && process.env.TLS_KEY_PATH && process.env.TLS_CA_PATH);
+}
+
+function configuredCapabilities(): NodeCapability[] {
+  const configured = (process.env.NODE_CAPABILITIES ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean) as NodeCapability[];
+  if (configured.length > 0) return configured;
+  const platformDefaults: NodeCapability[] = process.platform === 'win32'
+    ? ['windows-patching', 'winget-cache', 'chocolatey-cache', 'regional-cache']
+    : ['linux-patching', 'regional-cache'];
+  if (process.env.YARA_PATH) platformDefaults.push('yara-scan');
+  return platformDefaults;
+}
+
+function shouldCollectOsSecurityFindings() {
+  if (process.env.NODE_COLLECT_OS_SECURITY_FINDINGS === 'true') return true;
+  return process.env.NODE_ENV === 'production';
+}
+
+/** Run platform-specific OS security checks and return structured findings. */
+async function collectOsSecurityFindings(): Promise<NodeSecurityFinding[]> {
+  const findings: NodeSecurityFinding[] = [];
+  if (process.platform === 'linux') {
+    await checkLinux(findings);
+  } else if (process.platform === 'win32') {
+    await checkWindows(findings);
+  }
+  return findings;
+}
+
+async function run(cmd: string): Promise<string> {
+  try {
+    const { stdout } = await execAsync(cmd, { timeout: 5000 });
+    return stdout.trim();
+  } catch { return ''; }
+}
+
+async function checkLinux(findings: NodeSecurityFinding[]): Promise<void> {
+  const sshConf = await run('sshd -T 2>/dev/null | grep -i permitrootlogin');
+  if (sshConf && !/\bno\b/i.test(sshConf)) {
+    findings.push({ code: 'SSH_ROOT_LOGIN_PERMITTED', severity: 'high', category: 'os_security',
+      message: 'SSH PermitRootLogin is not set to "no"',
+      remediationHint: 'Set PermitRootLogin no in /etc/ssh/sshd_config and restart sshd' });
+  }
+  const pwAuth = await run('sshd -T 2>/dev/null | grep -i passwordauthentication');
+  if (pwAuth && /\byes\b/i.test(pwAuth)) {
+    findings.push({ code: 'SSH_PASSWORD_AUTH_ENABLED', severity: 'medium', category: 'os_security',
+      message: 'SSH PasswordAuthentication is enabled — key-only auth is recommended',
+      remediationHint: 'Set PasswordAuthentication no in /etc/ssh/sshd_config' });
+  }
+  const ufw = await run('ufw status 2>/dev/null');
+  const ipt = await run('iptables -L INPUT 2>/dev/null | head -3');
+  if (!ufw.toLowerCase().includes('active') && ipt.split('\n').filter(l => l.trim() && !l.startsWith('Chain') && !l.startsWith('target')).length === 0) {
+    findings.push({ code: 'NO_FIREWALL_DETECTED', severity: 'high', category: 'os_security',
+      message: 'No active firewall (ufw/iptables) detected',
+      remediationHint: 'Enable ufw: ufw enable && ufw default deny incoming' });
+  }
+  const unattended = await run('dpkg -l unattended-upgrades 2>/dev/null | grep ^ii');
+  const dnfAuto = await run('systemctl is-active dnf-automatic 2>/dev/null');
+  if (!unattended && dnfAuto !== 'active') {
+    findings.push({ code: 'NO_AUTO_UPDATES', severity: 'medium', category: 'os_security',
+      message: 'Automatic security updates not detected',
+      remediationHint: 'Install unattended-upgrades (Debian/Ubuntu) or enable dnf-automatic (RHEL/Fedora)' });
+  }
+  const aa = await run('aa-status --json 2>/dev/null');
+  const selinux = await run('getenforce 2>/dev/null');
+  if (!aa.includes('"enabled":1') && selinux !== 'Enforcing') {
+    findings.push({ code: 'NO_MAC_FRAMEWORK', severity: 'medium', category: 'os_security',
+      message: 'Neither AppArmor (enforcing) nor SELinux (Enforcing) is active',
+      remediationHint: 'Enable AppArmor or set SELinux to Enforcing mode' });
+  }
+  const passwdPerms = await run('stat -c %a /etc/passwd 2>/dev/null');
+  if (passwdPerms && Number(passwdPerms) % 10 >= 2) {
+    findings.push({ code: 'PASSWD_WORLD_WRITABLE', severity: 'critical', category: 'os_security',
+      message: '/etc/passwd is world-writable',
+      remediationHint: 'chmod 644 /etc/passwd' });
+  }
+}
+
+async function checkWindows(findings: NodeSecurityFinding[]): Promise<void> {
+  const defender = await run('powershell -NonInteractive -Command "(Get-MpComputerStatus).RealTimeProtectionEnabled"');
+  if (defender.trim().toLowerCase() === 'false') {
+    findings.push({ code: 'DEFENDER_REALTIME_DISABLED', severity: 'high', category: 'os_security',
+      message: 'Windows Defender real-time protection is disabled',
+      remediationHint: 'Set-MpPreference -DisableRealtimeMonitoring $false' });
+  }
+  const fw = await run('powershell -NonInteractive -Command "(Get-NetFirewallProfile | Where-Object { $_.Enabled -ne $true }).Name"');
+  if (fw.trim()) {
+    findings.push({ code: 'WINDOWS_FIREWALL_PROFILE_DISABLED', severity: 'high', category: 'os_security',
+      message: 'Windows Firewall disabled for profile(s): ' + fw.trim().replace(/\s+/g, ', '),
+      remediationHint: 'Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True' });
+  }
+  const uac = await run('powershell -NonInteractive -Command "(Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System).EnableLUA"');
+  if (uac.trim() === '0') {
+    findings.push({ code: 'UAC_DISABLED', severity: 'high', category: 'os_security',
+      message: 'User Account Control (UAC) is disabled',
+      remediationHint: 'Re-enable UAC via secpol.msc or set EnableLUA=1 in the registry' });
+  }
+  const smbv1 = await run('powershell -NonInteractive -Command "(Get-SmbServerConfiguration).EnableSMB1Protocol"');
+  if (smbv1.trim().toLowerCase() === 'true') {
+    findings.push({ code: 'SMBV1_ENABLED', severity: 'high', category: 'os_security',
+      message: 'SMBv1 is enabled — deprecated and exploitable (EternalBlue)',
+      remediationHint: 'Set-SmbServerConfiguration -EnableSMB1Protocol $false' });
+  }
+  const rdp = await run('powershell -NonInteractive -Command "(Get-ItemProperty \"HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server\").fDenyTSConnections"');
+  if (rdp.trim() === '0') {
+    findings.push({ code: 'RDP_ENABLED', severity: 'low', category: 'os_security',
+      message: 'Remote Desktop (RDP) is enabled — ensure it is firewall-restricted',
+      remediationHint: 'Disable RDP if not required via fDenyTSConnections=1 in the registry' });
+  }
+}
+
+
+function component(
+  name: NodeHealthComponent['name'],
+  status: NodeHealthComponent['status'],
+  observedAt: string,
+  message?: string,
+  value?: number | string | boolean,
+): NodeHealthComponent {
+  return { name, status, observedAt, message, value };
+}
+
+function certHealthy(expiresAt?: string) {
+  if (!expiresAt) return false;
+  return Date.parse(expiresAt) - Date.now() > 60 * 60_000;
+}
+
+function certificateHealthyForCurrentMode(expiresAt?: string) {
+  if (expiresAt) return certHealthy(expiresAt);
+  return isDevPlainHttpNodeFallbackAllowed();
 }

@@ -24,9 +24,20 @@ class DecommissionDto {
 export class NodeControlController {
   private readonly logger = new Logger(NodeControlController.name);
 
+  /**
+   * Creates a NodeControlController instance with its required collaborators.
+   *
+   * @param tasks tasks supplied to the function.
+   */
   constructor(private readonly tasks: TaskStore) {}
 
 
+  /**
+   * Handles the decommission operation for NodeControlController.
+   *
+   * @param dto Request payload or data transfer object.
+   * @returns The result produced by the operation.
+   */
   @Post('/decommission')
   async decommission(@Body() dto: DecommissionDto) {
     if (process.env.NODE_ID && dto.nodeId !== process.env.NODE_ID) {
@@ -93,6 +104,9 @@ export class NodeControlController {
   }
 }
 
+/**
+ * Handles the clear node configuration operation.
+ */
 async function clearNodeConfiguration() {
   const envPath = join(process.cwd(), '.env');
   const existing = await readFile(envPath, 'utf8').catch(() => '');
@@ -121,6 +135,12 @@ async function clearNodeConfiguration() {
   await writeFile(envPath, `${lines.join('\n')}\n`, 'utf8');
 }
 
+/**
+ * Produces the hash token security value.
+ *
+ * @param token Token used to authenticate or authorize the operation.
+ * @returns The result produced by the operation.
+ */
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
