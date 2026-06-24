@@ -1,8 +1,16 @@
 node_modules/
 dist/
 .env
+.env.*
+!.env.example
 *.log
 coverage/
 /data/
 package-cache/
 node_modules
+
+# Local secrets / signing material
+*.key
+*.pem
+*.pfx
+*.p12

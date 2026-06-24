@@ -2,7 +2,7 @@ import { Injectable, Logger, OnApplicationBootstrap, ServiceUnavailableException
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { createHash } from 'crypto';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { freemem, totalmem, release as osRelease } from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -444,7 +444,8 @@ export class ManagementService implements OnApplicationBootstrap {
     const queueSize = await this.queue.size();
     const cacheStatus = this.packages.status();
     const now = new Date().toISOString();
-    const memoryPressurePercent = Math.round(((totalmem() - freemem()) / Math.max(1, totalmem())) * 100);
+    const memoryPressure = readMemoryPressure();
+    const memoryPressurePercent = memoryPressure.pressurePercent;
     const clockSkewMs = serverTime ? Math.abs(Date.now() - Date.parse(serverTime)) : undefined;
     const components: NodeHealthComponent[] = [
       component('reachability', 'ok', now, 'node reached management over mTLS'),
@@ -453,7 +454,7 @@ export class ManagementService implements OnApplicationBootstrap {
       component('certificate', certificateHealthyForCurrentMode(this.certExpiresAt) ? 'ok' : 'degraded', now, this.certExpiresAt ? `expires=${this.certExpiresAt}` : 'no mTLS cert'),
       component('scanner', cacheStatus.scannerHealthy ? 'ok' : 'degraded', now),
       component('disk', cacheStatus.diskFreeBytes && cacheStatus.diskFreeBytes < 1024 * 1024 * 1024 ? 'degraded' : 'ok', now, undefined, cacheStatus.diskFreeBytes),
-      component('memory', memoryPressurePercent > 90 ? 'degraded' : 'ok', now, undefined, memoryPressurePercent),
+      component('memory', memoryPressurePercent > 90 ? 'degraded' : 'ok', now, memoryPressure.message, memoryPressurePercent),
       component('clock', clockSkewMs && clockSkewMs > 60_000 ? 'degraded' : 'ok', now, undefined, clockSkewMs),
       component('update_source', 'ok', now),
       component('cache', cacheStatus.healthy ? 'ok' : 'degraded', now),
@@ -590,6 +591,107 @@ function shouldCollectOsSecurityFindings() {
   return process.env.NODE_ENV === 'production';
 }
 
+type MemoryPressure = {
+  pressurePercent: number;
+  message: string;
+};
+
+type CgroupMemory = {
+  currentBytes: number;
+  maxBytes?: number;
+};
+
+function readMemoryPressure(): MemoryPressure {
+  if (isContainerRuntime()) {
+    const cgroup = readCgroupMemory();
+    if (cgroup) return memoryPressureFromValues(cgroup.currentBytes, cgroup.maxBytes);
+  }
+
+  return memoryPressureFromValues(undefined, undefined, totalmem(), freemem());
+}
+
+export function memoryPressureFromValues(
+  containerCurrentBytes?: number,
+  containerMaxBytes?: number,
+  hostTotalBytes = totalmem(),
+  hostFreeBytes = freemem(),
+): MemoryPressure {
+  if (Number.isFinite(containerCurrentBytes) && (containerCurrentBytes ?? 0) >= 0) {
+    let limitBytes = hostTotalBytes;
+    if (typeof containerMaxBytes === 'number' && Number.isFinite(containerMaxBytes) && containerMaxBytes > 0) {
+      limitBytes = containerMaxBytes;
+    }
+    return {
+      pressurePercent: percentage(containerCurrentBytes ?? 0, limitBytes),
+      message: `container memory ${formatBytes(containerCurrentBytes ?? 0)} / ${formatBytes(limitBytes)}`,
+    };
+  }
+
+  const usedBytes = Math.max(0, hostTotalBytes - hostFreeBytes);
+  return {
+    pressurePercent: percentage(usedBytes, hostTotalBytes),
+    message: `system memory ${formatBytes(usedBytes)} / ${formatBytes(hostTotalBytes)}`,
+  };
+}
+
+function isContainerRuntime(): boolean {
+  if (existsSync('/.dockerenv')) return true;
+  const cgroup = readTextFile('/proc/1/cgroup');
+  return /\b(docker|containerd|kubepods|podman)\b/i.test(cgroup);
+}
+
+function readCgroupMemory(): CgroupMemory | undefined {
+  const currentV2 = readNumberFile('/sys/fs/cgroup/memory.current');
+  if (currentV2 !== undefined) {
+    return { currentBytes: currentV2, maxBytes: readLimitFile('/sys/fs/cgroup/memory.max') };
+  }
+
+  const currentV1 = readNumberFile('/sys/fs/cgroup/memory/memory.usage_in_bytes');
+  if (currentV1 !== undefined) {
+    return { currentBytes: currentV1, maxBytes: readLimitFile('/sys/fs/cgroup/memory/memory.limit_in_bytes') };
+  }
+
+  return undefined;
+}
+
+function readNumberFile(path: string): number | undefined {
+  const value = readTextFile(path).trim();
+  if (!value || value === 'max') return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function readLimitFile(path: string): number | undefined {
+  const limit = readNumberFile(path);
+  if (!limit || limit >= Number.MAX_SAFE_INTEGER) return undefined;
+  return limit;
+}
+
+function readTextFile(path: string): string {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function percentage(usedBytes: number, totalBytes: number): number {
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((usedBytes / totalBytes) * 1000) / 10));
+}
+
+function formatBytes(bytes: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let value = Math.max(0, bytes);
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const precision = value >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(precision)} ${units[unitIndex]}`;
+}
+
 /** Run platform-specific OS security checks and return structured findings. */
 async function collectOsSecurityFindings(): Promise<NodeSecurityFinding[]> {
   const findings: NodeSecurityFinding[] = [];
@@ -643,11 +745,18 @@ async function checkLinux(findings: NodeSecurityFinding[]): Promise<void> {
       remediationHint: 'Enable AppArmor or set SELinux to Enforcing mode' });
   }
   const passwdPerms = await run('stat -c %a /etc/passwd 2>/dev/null');
-  if (passwdPerms && Number(passwdPerms) % 10 >= 2) {
+  if (isWorldWritableMode(passwdPerms)) {
     findings.push({ code: 'PASSWD_WORLD_WRITABLE', severity: 'critical', category: 'os_security',
       message: '/etc/passwd is world-writable',
       remediationHint: 'chmod 644 /etc/passwd' });
   }
+}
+
+export function isWorldWritableMode(mode: string): boolean {
+  const permissions = mode.trim().match(/[0-7]+$/)?.[0];
+  if (!permissions) return false;
+  const worldDigit = Number.parseInt(permissions.at(-1) ?? '', 8);
+  return Number.isFinite(worldDigit) && (worldDigit & 0o2) !== 0;
 }
 
 async function checkWindows(findings: NodeSecurityFinding[]): Promise<void> {

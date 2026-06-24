@@ -119,10 +119,11 @@ export interface AgentTask {
   appName?: string;
   packageArtifactId?: string;
   packageId?: string;
-  packageManager?: 'winget' | 'chocolatey' | 'scoop' | 'apt' | 'msi';
+  packageManager?: 'winget' | 'chocolatey' | 'scoop' | 'apt' | 'msi' | 'exe';
   packageScope?: 'system' | 'global' | 'user';
   productCode?: string;
   sourceUrl?: string;
+  managementSourceUrl?: string;
   sha256?: string;
   installArgs?: string;
   targetVersion?: string;

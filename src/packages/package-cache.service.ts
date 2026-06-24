@@ -22,12 +22,11 @@ export class PackageCacheService {
     const path = this.pathFor(task.packageArtifactId);
     const metaPath = this.metaPathFor(task.packageArtifactId);
     if (!existsSync(path) || !(await this.metadataVerified(metaPath, task.sha256))) {
-      const url = this.resolveManagementUrl(task.sourceUrl);
-      const res = await fetch(url, {
-        headers: {
-          'x-node-api-secret': process.env.NODE_API_SECRET ?? '',
-        },
-      });
+      const url = this.resolveManagementUrl(task.managementSourceUrl ?? task.sourceUrl);
+      const headers = sameOrigin(url, process.env.MANAGEMENT_URL) && process.env.NODE_API_SECRET
+        ? { 'x-node-api-secret': process.env.NODE_API_SECRET }
+        : undefined;
+      const res = await fetch(url, { headers });
       if (!res.ok) throw new Error(`Package download failed: ${res.status}`);
       const data = Buffer.from(await res.arrayBuffer());
       const actual = createHash('sha256').update(data).digest('hex');
@@ -133,4 +132,15 @@ export class PackageCacheService {
 async function sha256File(path: string) {
   const data = await import('fs/promises').then((fs) => fs.readFile(path));
   return createHash('sha256').update(data).digest('hex');
+}
+
+function sameOrigin(left: string, right?: string) {
+  if (!right) return false;
+  try {
+    const a = new URL(left);
+    const b = new URL(right);
+    return a.origin === b.origin;
+  } catch {
+    return false;
+  }
 }
